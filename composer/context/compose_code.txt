@@ -1,0 +1,448 @@
+################
+### <FILENAME>/dli/task/composer/.env</FILENAME>
+
+## This file belongs ABOVE the notebooks directory
+
+COMPOSE_PROJECT_NAME=c-fx-15-v1
+DEV_NGINX_PORT=80
+DEV_ASSESSMENT_PORT=81
+NVIDIA_API_KEY=nvapi-...  ## To be filled in
+
+################
+### <FILENAME>/dli/task/composer/Dockerfile</FILENAME>
+
+# Use a base image with Python
+FROM python:3.11-slim
+
+# Set working directory
+WORKDIR /dli
+
+RUN apt-get update && apt-get install -y apt-utils
+RUN apt-get install -y build-essential bash curl unzip wget git libgl1
+
+#Run pip dependencies
+COPY composer/requirements.txt .
+RUN pip3 install --upgrade pip
+RUN pip3 install -r requirements.txt
+RUN pip3 install ipywidgets jupyterlab==4.0.0 jupyter-archive==3.4.0
+
+# COPY notebooks
+WORKDIR /dli/task
+# COPY . .
+
+# --- Disable the startup privacy/news prompt (Announcements) ---
+# JupyterLab reads default settings from <sys.prefix>/share/jupyter/lab/settings/overrides.json
+# See docs: "overrides.json" and Announcements plugin.
+RUN jupyter labextension disable "@jupyterlab/apputils-extension:announcements"
+
+# Expose port 8888 for JupyterLab
+EXPOSE 8888 
+EXPOSE 9012
+
+# Start JupyterLab when the container runs
+ADD composer/entrypoint.sh /usr/local/bin
+RUN chmod +x /usr/local/bin/*.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+################
+### <FILENAME>/dli/task/composer/docker-compose.override.yml</FILENAME>
+
+version: '2.3'
+
+services:
+
+  # During development we want to build our Docker image from relevant
+  # Dockerfiles, as opposed to pulling it from a repository somewhere.
+
+  lab:
+    build: 
+      context: notebooks
+      dockerfile: composer/Dockerfile
+
+  assessment:
+    ports:
+      - $DEV_ASSESSMENT_PORT:8080
+
+  nginx:
+    ports:
+      - $DEV_NGINX_PORT:80
+
+  docker_router:
+    build: 
+      context: notebooks/docker_router
+      dockerfile: Dockerfile
+
+  llm_client:
+    build: 
+      context: notebooks/llm_client
+      dockerfile: Dockerfile_client
+    env_file:
+      - .env-dev  ## pass in your environment variable (i.e. NVIDIA_API_KEY)
+
+  frontend:
+    build: 
+      context: notebooks/frontend
+      dockerfile: Dockerfile
+
+  frontend_rproxy:
+    build: 
+      context: notebooks/frontend
+      dockerfile: Dockerfile
+
+  chatbot:
+    build: 
+      context: notebooks/chatbot
+      dockerfile: Dockerfile
+    env_file:
+      - .env-dev  ## pass in your environment variable (i.e. NVIDIA_API_KEY)
+
+  chatbot_rproxy:
+    build: 
+      context: notebooks/chatbot
+      dockerfile: Dockerfile
+    env_file:
+      - .env-dev  ## pass in your environment variable (i.e. NVIDIA_API_KEY)
+
+
+################
+### <FILENAME>/dli/task/composer/docker-compose.yml</FILENAME>
+
+version: '2.3'
+
+## To Build The Repo: Execute the following command from directory ABOVE notebook repository
+## Dev Environment:  docker-compose build && docker-compose up -d
+## Prod Environment: docker-compose -f docker-compose.yml -f docker-compose.deployment.yml build && ... 
+
+## Volume shared by frontend and assessment microservices. Frontend must write a file 
+## for the assessment microservice to give you credit. Good luck!!
+volumes:
+  assessment_results:
+
+services:  
+
+  ## Deliver jupyter labs interface for students.
+  lab:
+    container_name: jupyter-notebook-server  
+    init: true
+    volumes:  ## Allow /dli/task in container to reference ./notebooks/ in host
+      - ./notebooks/:/dli/task/
+      - ./nginx.conf:/dli/task/composer/nginx.conf
+      - ./docker-compose.yml:/dli/task/composer/docker-compose.yml
+      - ./docker-compose.override.yml:/dli/task/composer/docker-compose.override.yml
+    ports:  ## Expose the following ports for various features 
+      - "7860:7860"
+      - "9010:9010"
+      - "9011:9011"
+      - "9012:9012"
+    environment:  ## Change default base_url/mode for ChatNVIDIA etc.
+      - NVIDIA_DEFAULT_MODE=open
+      - NVIDIA_BASE_URL=http://llm_client:9000/v1
+      - JUPYTER_TOKEN
+
+  ## Deliver a server to interface with host docker orchestration
+  docker_router:
+    container_name: docker_router
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  ## Give access to host docker
+    ports:
+      - "8070:8070"
+
+  ## Deliver your llm_client microservice
+  llm_client:
+    container_name: llm_client
+    volumes:
+      - ./notebooks/llm_client:/llm_client
+    ports:
+      - "9000:9000"
+    # env_file:
+    #   - .env  ## pass in your environment variable (i.e. NVIDIA_API_KEY)
+    #   ## This file belongs ABOVE the notebooks directory. Contains some of the following:
+    #   # COMPOSE_PROJECT_NAME=c-fx-15-v1
+    #   # DEV_NGINX_PORT=80
+    #   # DEV_ASSESSMENT_PORT=81
+    #   # NVIDIA_API_KEY=nvapi-...  ## To be filled in
+
+  ## If you had an extra A100, you could deploy your own NIM LLM...
+  # nim:
+  #   user: root # you don't have to be the root, but need to specify some user
+  #   container_name: nim 
+  #     image: nvcr.io/nim/meta/llama-3.1-8b-instruct:1.1.2
+  #   runtime: nvidia
+  #   shm_size: 16gb
+  #   environment:
+  #     - NVIDIA_VISIBLE_DEVICES=1
+  #     # Necessary since we are running as root on potentially-multiple GPUs
+  #     - OMPI_ALLOW_RUN_AS_ROOT=1
+  #     - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+  #     - end_id
+  #   volumes:
+  #     - ./nim-cache/nim:/opt/nim/.cache
+  #   env_file:
+  #     - .env  ## pass in your environment variable through file (i.e. NGC_API_KEY)
+
+  ##############################################################################
+  ## Deliver your gradio frontend for assessment and web ui
+  frontend: 
+    container_name: frontend
+    volumes: 
+      - ./notebooks/:/notebooks/
+      - assessment_results:/results
+    ports:
+      - "8090:8090"
+    depends_on: 
+      - "lab"
+    environment:
+      - APP_BIND_PORT=8090
+
+  chatbot: 
+    container_name: chatbot
+    volumes: 
+      - ./notebooks/:/notebooks/
+      - ./notebooks/imgs/:/app/imgs
+      - ./notebooks/slides/:/app/slides
+      - ./notebooks/chatbot/notebook_chunks.json:/app/notebook_chunks.json
+    ports:
+      - "8999:8999"
+    depends_on: 
+      - "lab"
+    environment:
+      - APP_BIND_PORT=8999
+
+  ## Reverse-proxy option. If you can't access port 8090 in browser, try /8090
+  frontend_rproxy: 
+    container_name: frontend_rproxy
+    volumes: 
+      - ./notebooks/:/notebooks/
+      - assessment_results:/results
+    ports:
+      - "8091:8091"
+    depends_on: 
+      - "lab"
+    environment:
+      - APP_ROOT_PATH=/8090 
+      - APP_BIND_PORT=8091
+
+
+  chatbot_rproxy: 
+    container_name: chatbot_rproxy
+    volumes: 
+      - ./notebooks/:/notebooks/
+      - ./notebooks/imgs/:/app/imgs
+      - ./notebooks/slides/:/app/slides
+      - ./notebooks/chatbot/notebook_chunks.json:/app/notebook_chunks.json
+    ports:
+      - "8998:8998"
+    depends_on: 
+      - "lab"
+    environment:
+      - APP_ROOT_PATH=/8999 
+      - APP_BIND_PORT=8998
+
+  #############################################################################
+  ## Other Stuff: DLI-Specific
+
+  ## Modifier service. Does nothing in dev. Removes solution component in prod
+  mod:
+    container_name: modifier
+    image: python:3.10-slim
+    volumes: 
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./notebooks/:/notebooks/
+    depends_on: 
+      - "frontend"
+
+  ## Assessment microservice. Checks for assignment completion
+  assessment:
+    image: python:3.10-slim
+    volumes:
+      - assessment_results:/dli/assessment_results/
+      - ./assessment:/dli/assessment
+    entrypoint: ["/bin/sh", "-c"]
+    command: [". /dli/assessment/entrypoint.assessment.sh"]
+
+  ## Reverse-proxy (serving the front page) service
+  nginx:
+    image: nginx:1.15.12-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - lab
+
+networks:
+  default:
+    name: nvidia-llm
+
+
+################
+### <FILENAME>/dli/task/composer/entrypoint.sh</FILENAME>
+
+#!/bin/bash
+
+# JUPYTER_TOKEN will empty in development, but set for
+# deployments. It will be applied from the environment
+# automatically when running `docker-compose up`.
+# For more details see `docker-compose.production.yml`,
+# `docker-compose.override.yml`, and
+# `nginx.conf`.
+
+jupyter lab \
+        --ip 0.0.0.0                               `# Run on localhost` \
+        --allow-root                               `# Enable the use of sudo commands in the notebook` \
+        --no-browser                               `# Do not launch a browser by default` \
+        --NotebookApp.base_url="/lab"              `# Allow value to be passed in for production` \
+        --NotebookApp.token="$JUPYTER_TOKEN"       `# Do not require token to access notebook` \
+        --NotebookApp.password=""                  `# Do not require password to run jupyter server`
+
+
+################
+### <FILENAME>/dli/task/composer/nginx.conf</FILENAME>
+
+worker_processes auto;
+pid /etc/nginx/.nginx.pid;
+
+events {
+	worker_connections 768;
+}
+
+http {
+	sendfile on;
+	tcp_nopush on;
+	tcp_nodelay on;
+	client_max_body_size 0;
+	keepalive_timeout 65;
+	types_hash_max_size 2048;
+
+	default_type application/octet-stream;
+
+	ssl_protocols TLSv1 TLSv1.1 TLSv1.2; # Dropping SSLv3, ref: POODLE
+		ssl_prefer_server_ciphers on;
+
+	access_log /var/log/access.log;
+	error_log /var/log/error.log;
+
+	gzip on;
+	gzip_disable "msie6";
+
+	## Sticky sessions per https://github.com/gradio-app/gradio/pull/7935
+	upstream gradio-app {
+		ip_hash;
+		server frontend_rproxy:8091;
+	}
+
+	## Sticky sessions per https://github.com/gradio-app/gradio/pull/7935
+	upstream gradio-chat {
+		ip_hash;
+		server chatbot_rproxy:8998;
+	}
+
+	upstream gradio-pass {
+		ip_hash;
+        server lab:7860; 
+	}
+
+	server {
+
+		listen 80 default_server;
+		listen [::]:80 default_server;
+
+		location / {
+			proxy_pass http://localhost/lab;
+			proxy_http_version 1.1;
+			proxy_set_header Upgrade $http_upgrade;
+			proxy_set_header Connection "upgrade";
+			proxy_set_header Host $http_host;
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+			proxy_buffering off;
+		}
+
+		location /lab {
+			proxy_pass http://lab:8888;
+			proxy_http_version 1.1;
+			proxy_set_header Upgrade $http_upgrade;
+			proxy_set_header Connection "upgrade";
+			proxy_set_header Host $http_host;
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+			proxy_buffering off;
+		}
+
+		# https://www.gradio.app/guides/running-gradio-on-your-web-server-with-nginx
+		location /8090/ {
+			proxy_pass http://gradio-app/;
+			proxy_http_version 1.1;
+			proxy_buffering off;
+			proxy_redirect off;
+			proxy_set_header Host $http_host;  # Use $http_host to pass the original Host header
+			proxy_set_header X-Real-IP $remote_addr;  # Pass the original client IP
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # Append the client IP to X-Forwarded-For
+			proxy_set_header X-Forwarded-Host $host;
+			proxy_set_header X-Forwarded-Proto $scheme;
+			proxy_set_header Connection "";  # For HTTP/1.1 compatibility
+			proxy_set_header Upgrade $http_upgrade;  # For WebSocket support
+		}
+
+		# https://www.gradio.app/guides/running-gradio-on-your-web-server-with-nginx
+		location /8999/ {
+			proxy_pass http://gradio-chat/;
+			proxy_http_version 1.1;
+			proxy_buffering off;
+			proxy_redirect off;
+			proxy_set_header Host $http_host;
+			proxy_set_header X-Real-IP $remote_addr;
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+			proxy_set_header X-Forwarded-Host $host;
+			proxy_set_header X-Forwarded-Proto $scheme;
+			proxy_set_header Upgrade $http_upgrade;
+			proxy_set_header Connection "upgrade";
+		}
+
+		location /7860/ {
+			proxy_pass http://gradio-pass/;
+			proxy_http_version 1.1;
+			proxy_buffering off;
+			proxy_redirect off;
+			proxy_set_header Host $http_host;  # Use $http_host to pass the original Host header
+			proxy_set_header X-Real-IP $remote_addr;  # Pass the original client IP
+			proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # Append the client IP to X-Forwarded-For
+			proxy_set_header X-Forwarded-Host $host;
+			proxy_set_header X-Forwarded-Proto $scheme;
+			proxy_set_header Connection "";  # For HTTP/1.1 compatibility
+			proxy_set_header Upgrade $http_upgrade;  # For WebSocket support
+		}
+	}
+}
+
+
+################
+### <FILENAME>/dli/task/composer/requirements.txt</FILENAME>
+
+## For networking
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+sse_starlette==2.1.0
+httpx_sse==0.4.0
+
+## LangChain 
+langchain_nvidia_ai_endpoints==0.3.9
+langchain_openai==0.3.7
+langchain==0.3.20
+langchain_community==0.3.19
+langserve==0.3.1
+
+pydantic==2.8.2
+openai==1.65.2
+
+## Milvus/Embeddings
+faiss-cpu==1.8.0
+
+## For Arxiv
+arxiv==2.1.0
+pymupdf==1.24.4
+
+## Gradio
+gradio==4.41.0
+
+## ML/DL
+keras==2.15.0
+tensorflow-cpu==2.15.0
+scikit-learn==1.4.2
+
